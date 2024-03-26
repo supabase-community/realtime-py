@@ -13,6 +13,8 @@ class Message:
     ref: Any
     topic: str
 
+    join_ref: Any = None  # V2
+
     def __hash__(self):
         return hash((self.event, tuple(list(self.payload.values())), self.ref, self.topic))
 
@@ -32,4 +34,4 @@ class ChannelEvents(str, Enum):
 
 
 PHOENIX_CHANNEL = "phoenix"
-HEARTBEAT_PAYLOAD = {"msg": "ping"}
+HEARTBEAT_PAYLOAD = {}
