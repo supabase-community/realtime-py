@@ -2,21 +2,30 @@ import asyncio
 import json
 import logging
 import re
-from collections import defaultdict
+from ast import List
 from functools import wraps
-from typing import Any, DefaultDict, Dict, List, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import websockets
 
 from realtime.channel import Channel
 from realtime.exceptions import NotConnectedError
-from realtime.message import HEARTBEAT_PAYLOAD, PHOENIX_CHANNEL, ChannelEvents, Message
+from realtime.message import Message
 from realtime.transformers import http_endpoint_url
-from realtime.types import Callback, T_ParamSpec, T_Retval
+from realtime.types import (
+    DEFAULT_TIMEOUT,
+    PHOENIX_CHANNEL,
+    Callback,
+    ChannelEvents,
+    T_ParamSpec,
+    T_Retval,
+)
 
-# logging.basicConfig(
-#     format="%(asctime)s:%(levelname)s - %(message)s", level=logging.INFO
-# )
+logging.basicConfig(
+    format="%(asctime)s:%(levelname)s - %(message)s", level=logging.INFO
+)
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_connection(func: Callback):
@@ -37,41 +46,37 @@ class Socket:
         token: str,
         auto_reconnect: bool = False,
         params: Dict[str, Any] = {},
-        hb_interval: int = 5,
+        hb_interval: int = 30,
+        max_retries: int = 5,
+        initial_backoff: float = 1.0,
     ) -> None:
         """
-        `Socket` is the abstraction for an actual socket connection that receives and 'reroutes' `Message` according to its `topic` and `event`.
-        Socket-Channel has a 1-many relationship.
-        Socket-Topic has a 1-many relationship.
-        :param url: Websocket URL of the Realtime server. starts with `ws://` or `wss://`. Also accepts default Supabase URL: `http://` or `https://`
-        :param params: Optional parameters for connection.
-        :param hb_interval: WS connection is kept alive by sending a heartbeat message. Optional, defaults to 5.
+        Initialize a Socket instance for WebSocket communication.
+
+        :param url: WebSocket URL of the Realtime server. Starts with `ws://` or `wss://`.
+                    Also accepts default Supabase URL: `http://` or `https://`.
+        :param token: Authentication token for the WebSocket connection.
+        :param auto_reconnect: If True, automatically attempt to reconnect on disconnection. Defaults to False.
+        :param params: Optional parameters for the connection. Defaults to an empty dictionary.
+        :param hb_interval: Interval (in seconds) for sending heartbeat messages to keep the connection alive. Defaults to 30.
+        :param max_retries: Maximum number of reconnection attempts. Defaults to 5.
+        :param initial_backoff: Initial backoff time (in seconds) for reconnection attempts. Defaults to 1.0.
         """
-        self.url = f"{re.sub(r'https?://', 'wss://', url, flags=re.IGNORECASE)}/realtime/v1/websocket?apikey={token}"
+        self.url = f"{re.sub(r'https://', 'wss://', re.sub(r'http://', 'ws://', url, flags=re.IGNORECASE), flags=re.IGNORECASE)}/websocket?apikey={token}"
         self.http_endpoint = http_endpoint_url(url)
-        self.channels = defaultdict(list)
         self.is_connected = False
         self.params = params
+        self.apikey = token
+        self.access_token = token
+        self.send_buffer: List[Callable] = []
         self.hb_interval = hb_interval
-        self.ws_connection: websockets.client.WebSocketClientProtocol
-        self.kept_alive = False
+        self.ws_connection: Optional[websockets.client.WebSocketClientProtocol] = None
         self.ref = 0
         self.auto_reconnect = auto_reconnect
-
-        self.channels: DefaultDict[str, List[Channel]] = defaultdict(list)
-
-        self._access_token: Union[str, None] = token
-        self._api_key = token
-
-    @ensure_connection
-    def listen(self) -> None:
-        """
-        Wrapper for async def _listen() to expose a non-async interface
-        In most cases, this should be the last method executed as it starts an infinite listening loop.
-        :return: None
-        """
-        loop = asyncio.get_event_loop()  # TODO: replace with get_running_loop
-        loop.run_until_complete(asyncio.gather(self._listen(), self._keep_alive()))
+        self.channels: Dict[str, Channel] = {}
+        self.max_retries = max_retries
+        self.initial_backoff = initial_backoff
+        self.timeout = DEFAULT_TIMEOUT
 
     async def _listen(self) -> None:
         """
@@ -81,85 +86,113 @@ class Socket:
         while True:
             try:
                 msg = await self.ws_connection.recv()
+                logging.info(f"receive: {msg}")
+
                 msg = Message(**json.loads(msg))
-                for channel in self.channels.get(msg.topic, []):
-                    for cl in channel.listeners:
-                        if cl.event == msg.event:
-                            if cl.event in ["presence_diff", "presence_state"]:
-                                cl.callback(msg.payload)
-                                continue
-                            if cl.event in ["postgres_changes"]:
-                                cl.callback(msg.payload)
-                                continue
-                            if cl.on_params["event"] in [msg.payload["event"], "*"]:
-                                cl.callback(msg.payload)
+                channel = self.channels.get(msg.topic)
+
+                if channel:
+                    channel._trigger(msg.event, msg.payload, msg.ref)
+                else:
+                    logging.info(f"Channel {msg.topic} not found")
+
             except websockets.exceptions.ConnectionClosed:
                 if self.auto_reconnect:
                     logging.info(
                         "Connection with server closed, trying to reconnect..."
                     )
                     await self._connect()
-                    for topic, channels in self.channels.items():
-                        for channel in channels:
-                            await channel.join()
+                    for topic, channel in self.channels.items():
+                        await channel.join()
                 else:
                     logging.exception("Connection with the server closed.")
                     break
 
-    def connect(self) -> None:
+    async def connect(self) -> None:
         """
-        Wrapper for async def _connect() to expose a non-async interface
-        """
+        Establishes a WebSocket connection with exponential backoff retry mechanism.
 
-        loop = asyncio.get_event_loop()  # TODO: replace with get_running
-        loop.run_until_complete(self._connect())
+        This method attempts to connect to the WebSocket server. If the connection fails,
+        it will retry with an exponential backoff strategy up to a maximum number of retries.
+
+        Returns:
+            None
+
+        Raises:
+            Exception: If unable to establish a connection after max_retries attempts.
+
+        Note:
+            - The initial backoff time and maximum retries are set during Socket initialization.
+            - The backoff time doubles after each failed attempt, up to a maximum of 60 seconds.
+        """
+        retries = 0
+        backoff = self.initial_backoff
+
+        while retries < self.max_retries:
+            try:
+                self.ws_connection = await websockets.connect(self.url)
+                if self.ws_connection.open:
+                    logging.info("Connection was successful")
+                    return await self._on_connect()
+                else:
+                    raise Exception("Failed to open WebSocket connection")
+            except Exception as e:
+                retries += 1
+                if retries >= self.max_retries or not self.auto_reconnect:
+                    logging.error(
+                        f"Failed to establish WebSocket connection after {retries} attempts: {e}"
+                    )
+                    raise
+                else:
+                    wait_time = backoff * (2 ** (retries - 1))  # Exponential backoff
+                    logging.info(
+                        f"Connection attempt {retries} failed. Retrying in {wait_time:.2f} seconds..."
+                    )
+                    await asyncio.sleep(wait_time)
+                    backoff = min(backoff * 2, 60)  # Cap the backoff at 60 seconds
+
+        raise Exception(
+            f"Failed to establish WebSocket connection after {self.max_retries} attempts"
+        )
+
+    async def listen(self):
+        await asyncio.gather(self._listen(), self._heartbeat())
+
+    async def _on_connect(self):
         self.is_connected = True
+        await self._flush_send_buffer()
 
-    async def _connect(self) -> None:
-        try:
-            ws_connection = await websockets.connect(self.url)
-        except Exception as e:
-            logging.error(f"Failed to establish WebSocket connection: {e}")
-            if self.auto_reconnect:
-                logging.info("Retrying connection...")
-                await asyncio.sleep(5)  # Wait before retrying
-                await self._connect()  # Retry connection
-            else:
-                raise
-
-        if ws_connection.open:
-            logging.info("Connection was successful")
-            self.ws_connection = ws_connection
-            self.is_connected = True
-        else:
-            raise Exception("Failed to open WebSocket connection")
+    async def _flush_send_buffer(self):
+        if self.is_connected and len(self.send_buffer) > 0:
+            for callback in self.send_buffer:
+                await callback()
+            self.send_buffer = []
 
     @ensure_connection
-    def close(self) -> None:
+    async def close(self) -> None:
         """
-        Wrapper for async def _close() to expose a non-async interface
-        """
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._close())
-        self.connected = False
+        Close the WebSocket connection.
 
-    async def _close(self) -> None:
+        Returns:
+            None
+
+        Raises:
+            NotConnectedError: If the connection is not established when this method is called.
+        """
+
         await self.ws_connection.close()
+        self.is_connected = False
 
-    async def _keep_alive(self) -> None:
-        """
-        Sending heartbeat to server every 5 seconds
-        Ping - pong messages to verify connection is alive
-        """
-        while True:
+    async def _heartbeat(self) -> None:
+        while self.is_connected:
             try:
                 data = dict(
                     topic=PHOENIX_CHANNEL,
                     event=ChannelEvents.heartbeat,
-                    payload=HEARTBEAT_PAYLOAD,
+                    payload={},
                     ref=None,
                 )
-                await self.ws_connection.send(json.dumps(data))
+                await self.send(data)
                 await asyncio.sleep(self.hb_interval)
             except websockets.exceptions.ConnectionClosed:
                 if self.auto_reconnect:
@@ -172,44 +205,85 @@ class Socket:
                     break
 
     @ensure_connection
-    def set_channel(self, topic: str, channel_params: Dict[str, Any]) -> Channel:
+    def channel(self, topic: str, params: Dict[str, Any] = {"config": {}}) -> Channel:
         """
         :param topic: Initializes a channel and creates a two-way association with the socket
         :return: Channel
         """
         topic = f"realtime:{topic}"
-        chan = Channel(self, topic, channel_params, self.params)
-        self.channels[topic].append(chan)
+        chan = Channel(self, topic, params)
+        self.channels[topic] = chan
 
         return chan
-
-    def add_channel(self, channel: Channel) -> None:
-        """
-        Associates the given channel object with the socket.
-        :param channel: Channel object to associate with the socket.
-        :return: None
-        """
-        topic = channel.topic
-        self.channels[topic].append(channel)
 
     def summary(self) -> None:
         """
         Prints a list of topics and event the socket is listening to
         :return: None
         """
-        for topic, chans in self.channels.items():
-            for chan in chans:
-                print(f"Topic: {topic} | Events: {[e for e, _ in chan.listeners]}]")
+        for topic, channel in self.channels.items():
+            print(f"Topic: {topic} | Events: {[e for e, _ in channel.listeners]}]")
 
     @ensure_connection
-    def set_auth(self, token: Union[str, None]) -> None:
-        self._access_token = token
+    async def set_auth(self, token: Union[str, None]) -> None:
+        """
+        Set the authentication token for the connection and update all joined channels.
 
-        for _, channels in self.channels.items():
-            for channel in channels:
-                if channel.joined:
-                    channel._push(ChannelEvents.access_token, {"access_token": token})
+        This method updates the access token for the current connection and sends the new token
+        to all joined channels. This is useful for refreshing authentication or changing users.
+
+        Args:
+            token (Union[str, None]): The new authentication token. Can be None to remove authentication.
+
+        Returns:
+            None
+        """
+        self.access_token = token
+
+        for _, channel in self.channels.items():
+            if channel.joined:
+                await channel.push(ChannelEvents.access_token, {"access_token": token})
 
     def _make_ref(self) -> str:
         self.ref += 1
         return f"{self.ref}"
+
+    async def send(self, message: Dict[str, Any]) -> None:
+        """
+        Send a message through the WebSocket connection.
+
+        This method serializes the given message dictionary to JSON,
+        and sends it through the WebSocket connection. If the connection
+        is not currently established, the message will be buffered and sent
+        once the connection is re-established.
+
+        Args:
+            message (Dict[str, Any]): The message to be sent, as a dictionary.
+
+        Returns:
+            None
+
+        Raises:
+            websockets.exceptions.WebSocketException: If there's an error sending the message.
+        """
+
+        message = json.dumps(message)
+        logger.info(f"send: {message}")
+
+        async def send_message():
+            await self.ws_connection.send(message)
+
+        if self.is_connected:
+            await send_message()
+        else:
+            self.send_buffer.append(send_message)
+
+    async def _leave_open_topic(self, topic: str):
+        dup_channels = [
+            ch
+            for ch in self.channels.values()
+            if ch.topic == topic and (ch.is_joined or ch.is_joining)
+        ]
+
+        for ch in dup_channels:
+            await ch.unsubscribe()
